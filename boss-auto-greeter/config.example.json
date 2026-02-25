@@ -1,0 +1,65 @@
+{
+  "cron": "*/30 * * * *",
+  "timezone": "Asia/Shanghai",
+  "runOnStartup": true,
+  "dryRun": true,
+  "autoSend": false,
+  "maxJobsPerSearch": 60,
+  "maxGreetingsPerRound": 20,
+  "storePath": "./state/processed-jobs.json",
+  "session": {
+    "headless": false,
+    "slowMo": 120,
+    "loginWaitMs": 180000,
+    "resultWaitMs": 2500,
+    "storageStatePath": "./state/storage-state.json"
+  },
+  "searches": [
+    {
+      "keyword": "前端开发",
+      "cityCode": "101020100",
+      "locations": ["上海", "浦东"],
+      "salary": {
+        "minK": 20,
+        "maxK": 50
+      }
+    },
+    {
+      "keyword": "Node.js",
+      "cityCode": "101010100",
+      "locations": ["北京"],
+      "salary": {
+        "minK": 25,
+        "maxK": 60
+      }
+    }
+  ],
+  "greetingTemplates": [
+    "您好，我对{companyName}的{jobTitle}岗位很感兴趣，希望进一步了解职责与技术栈。",
+    "你好，我有相关项目经验，想沟通下{jobTitle}岗位细节，期待回复。"
+  ],
+  "selectors": {
+    "jobCard": ".job-card-wrapper",
+    "jobTitle": [".job-name", ".job-title", ".job-name a"],
+    "salary": [".salary"],
+    "company": [".company-name", ".company-text"],
+    "location": [".job-area", ".company-location"],
+    "detailLink": "a[href*='/job_detail/']",
+    "contactButtons": [
+      "button:has-text('立即沟通')",
+      "a:has-text('立即沟通')",
+      "button:has-text('沟通')",
+      "a:has-text('沟通')"
+    ],
+    "messageInputs": [
+      "textarea",
+      "div[contenteditable='true']",
+      ".chat-editor [contenteditable='true']"
+    ],
+    "sendButtons": [
+      "button:has-text('发送')",
+      "button:has-text('Send')",
+      ".op-btn"
+    ]
+  }
+}

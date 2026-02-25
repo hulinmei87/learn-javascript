@@ -1,0 +1,22 @@
+{
+  "name": "boss-auto-greeter",
+  "version": "0.1.0",
+  "description": "按配置定时检索 Boss 岗位并自动发送招呼语",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "boss",
+    "job",
+    "automation"
+  ],
+  "author": "cursor-cloud-agent",
+  "license": "ISC",
+  "dependencies": {
+    "node-cron": "^4.2.1",
+    "playwright": "^1.58.2"
+  }
+}

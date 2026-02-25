@@ -44,3 +44,7 @@ MANIFEST
 *.mo
 .*
 
+# boss-auto-greeter runtime files
+boss-auto-greeter/config.json
+boss-auto-greeter/state/*.json
+
