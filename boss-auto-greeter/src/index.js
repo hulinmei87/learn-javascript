@@ -1,137 +1,70 @@
-import cron from "node-cron";
-import { loadConfig } from "./config.js";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { BotManager } from "./botManager.js";
+import { createControlServer } from "./controlServer.js";
 import { createLogger } from "./logger.js";
-import { ProcessedStore } from "./store.js";
-import { BossWebClient } from "./bossWebClient.js";
-import { buildJobKey, jobMatches } from "./filters.js";
-import { renderGreeting } from "./greeting.js";
 
 const logger = createLogger();
 
+function asBooleanEnv(value, fallback) {
+  if (value == null || value === "") {
+    return fallback;
+  }
+
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(normalized)) {
+    return true;
+  }
+
+  if (["0", "false", "no", "n", "off"].includes(normalized)) {
+    return false;
+  }
+
+  return fallback;
+}
+
 async function main() {
   const configPath = process.env.BOSS_BOT_CONFIG ?? "./config.json";
-  const config = await loadConfig(configPath);
+  const host = process.env.CONTROL_HOST ?? "0.0.0.0";
+  const port = Number(process.env.CONTROL_PORT ?? 8787);
+  const authToken = process.env.CONTROL_TOKEN || "";
+  const autoStart = asBooleanEnv(process.env.BOSS_BOT_AUTO_START, true);
+  const currentDir = path.dirname(fileURLToPath(import.meta.url));
+  const staticDir = path.resolve(currentDir, "../web");
 
-  logger.info("Configuration loaded.", {
-    configPath: config.__configPath,
-    cron: config.cron,
-    timezone: config.timezone,
-    dryRun: config.dryRun,
-    autoSend: config.autoSend
+  const manager = new BotManager({
+    configPath,
+    logger
+  });
+  await manager.init();
+
+  logger.info("Manager initialized.", {
+    configPath: manager.configPath,
+    autoStart
   });
 
-  const store = new ProcessedStore(config.storePath, logger);
-  await store.init();
-  logger.info("Processed store loaded.", { count: store.size(), path: config.storePath });
+  if (!authToken) {
+    logger.warn("CONTROL_TOKEN not set. Dashboard APIs are not protected by token.");
+  }
 
-  const client = new BossWebClient(config, logger);
-  await client.init();
-  await client.ensureLogin();
+  const controlServer = createControlServer({
+    manager,
+    logger,
+    host,
+    port: Number.isFinite(port) ? port : 8787,
+    staticDir,
+    authToken
+  });
+  await controlServer.start();
 
-  let running = false;
-  const runRound = async () => {
-    if (running) {
-      logger.warn("Last round is still running. Current trigger skipped.");
-      return;
-    }
+  logger.info("Dashboard ready.", {
+    url: `http://${host}:${Number.isFinite(port) ? port : 8787}`
+  });
 
-    running = true;
-    const stats = {
-      fetched: 0,
-      matched: 0,
-      skippedDuplicate: 0,
-      sent: 0,
-      dryRun: 0,
-      failed: 0
-    };
-
-    logger.info("A new round started.");
-    try {
-      for (const search of config.searches) {
-        if (stats.sent + stats.dryRun >= config.maxGreetingsPerRound) {
-          logger.info("Round reached maxGreetingsPerRound, remaining searches skipped.");
-          break;
-        }
-
-        await client.openSearch(search);
-        const jobs = await client.collectJobs(config.maxJobsPerSearch);
-        stats.fetched += jobs.length;
-
-        const matchedJobs = jobs.filter((job) => jobMatches(job, search));
-        stats.matched += matchedJobs.length;
-
-        logger.info("Search fetched jobs.", {
-          keyword: search.keyword,
-          fetched: jobs.length,
-          matched: matchedJobs.length
-        });
-
-        for (const job of matchedJobs) {
-          if (stats.sent + stats.dryRun >= config.maxGreetingsPerRound) {
-            logger.info("Round reached maxGreetingsPerRound, job loop stopped.");
-            break;
-          }
-
-          const key = buildJobKey(job);
-          if (store.has(key)) {
-            stats.skippedDuplicate += 1;
-            continue;
-          }
-
-          const message = renderGreeting(config.greetingTemplates, job);
-          const result = await client.sendGreeting(job, message, {
-            dryRun: config.dryRun,
-            autoSend: config.autoSend
-          });
-
-          if (result.status === "sent" || result.status === "dry_run") {
-            await store.mark(key, {
-              mode: result.status,
-              title: job.title,
-              salaryText: job.salaryText,
-              companyName: job.companyName,
-              locationText: job.locationText,
-              detailUrl: job.detailUrl,
-              message
-            });
-
-            if (result.status === "sent") {
-              stats.sent += 1;
-            } else {
-              stats.dryRun += 1;
-            }
-          } else {
-            stats.failed += 1;
-            logger.warn("Greeting action failed.", {
-              id: job.id,
-              reason: result.reason ?? "unknown"
-            });
-          }
-        }
-      }
-    } catch (error) {
-      logger.error("Round failed.", error.stack ?? error.message);
-    } finally {
-      running = false;
-      logger.info("Round finished.", stats);
-    }
-  };
-
-  const task = cron.schedule(
-    config.cron,
-    () => {
-      void runRound();
-    },
-    {
-      timezone: config.timezone
-    }
-  );
-
-  task.start();
-  logger.info("Scheduler started and waiting for next trigger.");
-
-  if (config.runOnStartup) {
-    await runRound();
+  if (autoStart) {
+    await manager.start();
+  } else {
+    logger.info("Auto start disabled. Use dashboard button or /api/start to launch.");
   }
 
   let stopping = false;
@@ -142,8 +75,8 @@ async function main() {
 
     stopping = true;
     logger.info(`Received ${signal}, shutting down.`);
-    task.stop();
-    await client.close();
+    await controlServer.stop().catch(() => undefined);
+    await manager.shutdown().catch(() => undefined);
     process.exit(0);
   };
 

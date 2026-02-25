@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { access, readFile } from "node:fs/promises";
+import { access, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 const DEFAULT_SELECTORS = {
@@ -130,8 +130,19 @@ function validateConfig(config) {
   }
 }
 
-export async function loadConfig(configPath = process.env.BOSS_BOT_CONFIG ?? "./config.json") {
-  const absolutePath = path.resolve(configPath);
+export function resolveConfigPath(configPath = process.env.BOSS_BOT_CONFIG ?? "./config.json") {
+  return path.resolve(configPath);
+}
+
+export function parseConfigObject(rawConfig, configPath = process.env.BOSS_BOT_CONFIG ?? "./config.json") {
+  const absolutePath = resolveConfigPath(configPath);
+  const config = normalizeConfig(rawConfig, absolutePath);
+  validateConfig(config);
+  return config;
+}
+
+export async function loadRawConfig(configPath = process.env.BOSS_BOT_CONFIG ?? "./config.json") {
+  const absolutePath = resolveConfigPath(configPath);
 
   try {
     await access(absolutePath, constants.R_OK);
@@ -142,17 +153,28 @@ export async function loadConfig(configPath = process.env.BOSS_BOT_CONFIG ?? "./
   }
 
   const fileContent = await readFile(absolutePath, "utf8");
-
-  let rawConfig;
   try {
-    rawConfig = JSON.parse(fileContent);
+    return JSON.parse(fileContent);
   } catch (error) {
     throw new Error(`Unable to parse JSON config: ${error.message}`);
   }
+}
 
-  const config = normalizeConfig(rawConfig, absolutePath);
-  validateConfig(config);
-  return config;
+export async function saveRawConfig(
+  rawConfig,
+  configPath = process.env.BOSS_BOT_CONFIG ?? "./config.json"
+) {
+  const absolutePath = resolveConfigPath(configPath);
+  parseConfigObject(rawConfig, absolutePath);
+  await writeFile(absolutePath, `${JSON.stringify(rawConfig, null, 2)}\n`, "utf8");
+  return absolutePath;
+}
+
+export async function loadConfig(configPath = process.env.BOSS_BOT_CONFIG ?? "./config.json") {
+  const absolutePath = path.resolve(configPath);
+
+  const rawConfig = await loadRawConfig(absolutePath);
+  return parseConfigObject(rawConfig, absolutePath);
 }
 
 export const defaultSelectors = DEFAULT_SELECTORS;

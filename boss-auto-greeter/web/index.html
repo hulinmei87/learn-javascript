@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Boss Auto Greeter 控制台</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main class="container">
+      <header class="header">
+        <h1>Boss Auto Greeter</h1>
+        <p>手机可访问控制台：开始 / 暂停 / 配置编辑 / 手动执行</p>
+      </header>
+
+      <section class="card">
+        <h2>访问令牌（可选）</h2>
+        <div class="row">
+          <input id="tokenInput" type="password" placeholder="输入 CONTROL_TOKEN（如已启用）" />
+          <button id="saveTokenBtn">保存令牌</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>运行状态</h2>
+        <div id="statusGrid" class="status-grid"></div>
+        <div class="button-row">
+          <button id="refreshStatusBtn">刷新状态</button>
+          <button id="startBtn" class="primary">开始</button>
+          <button id="pauseBtn">暂停</button>
+          <button id="runOnceBtn">立即执行一次</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>配置编辑（JSON）</h2>
+        <p class="hint">保存后会自动重载并应用配置。</p>
+        <textarea id="configEditor" spellcheck="false"></textarea>
+        <div class="button-row">
+          <button id="loadConfigBtn">读取配置</button>
+          <button id="saveConfigBtn" class="primary">保存配置</button>
+          <button id="reloadConfigBtn">从磁盘重载</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>操作日志</h2>
+        <pre id="logBox" class="log-box"></pre>
+      </section>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
