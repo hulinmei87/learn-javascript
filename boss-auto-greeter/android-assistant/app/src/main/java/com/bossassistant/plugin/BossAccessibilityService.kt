@@ -14,12 +14,23 @@ import android.provider.Settings
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import org.json.JSONObject
+import java.util.UUID
 
 class BossAccessibilityService : AccessibilityService() {
     private val handler = Handler(Looper.getMainLooper())
+    private val ocrClickHelper by lazy { OcrClickHelper(this) }
     private var roundRunning = false
     private var stopRequested = false
     private var commandReceiver: BroadcastReceiver? = null
+    private var roundState: RoundState? = null
+
+    private data class RoundState(
+        val id: String,
+        val startedAt: Long,
+        var sentCount: Int = 0,
+        var attemptCount: Int = 0,
+        var ocrFallbackHits: Int = 0
+    )
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -35,7 +46,27 @@ class BossAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // 本服务以主动调度为主，事件仅用于维持连接。
+        if (event == null || roundRunning || !ConfigStore.isRecording(this)) {
+            return
+        }
+        if (event.eventType != AccessibilityEvent.TYPE_VIEW_CLICKED) {
+            return
+        }
+
+        val cfg = ConfigStore.load(this)
+        val sourcePackage = event.packageName?.toString().orEmpty()
+        if (sourcePackage != cfg.bossPackageName) {
+            return
+        }
+
+        val source = event.source ?: return
+        ConfigStore.applyRecordingCapture(
+            context = this,
+            text = NodeUtils.nodeText(source),
+            viewId = source.viewIdResourceName,
+            className = source.className?.toString()
+        )
+        notifyStatusRefresh()
     }
 
     override fun onInterrupt() {
@@ -58,12 +89,30 @@ class BossAccessibilityService : AccessibilityService() {
                         stopRequested = true
                         ConfigStore.appendLog(this@BossAccessibilityService, "接收到暂停指令。")
                     }
+
+                    ACTION_RECORD_START -> {
+                        ConfigStore.startRecording(this@BossAccessibilityService)
+                        notifyStatusRefresh()
+                    }
+
+                    ACTION_RECORD_STOP -> {
+                        ConfigStore.stopRecording(this@BossAccessibilityService)
+                        notifyStatusRefresh()
+                    }
+
+                    ACTION_RECORD_CLEAR -> {
+                        ConfigStore.clearRecordedRules(this@BossAccessibilityService)
+                        notifyStatusRefresh()
+                    }
                 }
             }
         }
         val filter = IntentFilter().apply {
             addAction(ACTION_RUN_ROUND)
             addAction(ACTION_PAUSE)
+            addAction(ACTION_RECORD_START)
+            addAction(ACTION_RECORD_STOP)
+            addAction(ACTION_RECORD_CLEAR)
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -84,11 +133,15 @@ class BossAccessibilityService : AccessibilityService() {
 
         roundRunning = true
         stopRequested = false
+        roundState = RoundState(
+            id = UUID.randomUUID().toString(),
+            startedAt = System.currentTimeMillis()
+        )
         val cfg = ConfigStore.load(this)
         ConfigStore.appendLog(this, "开始执行一轮自动化，来源：$source")
 
         if (!launchBossApp(cfg.bossPackageName)) {
-            finishRound("无法拉起 Boss App，请检查包名或安装状态。")
+            finishRound("无法拉起 Boss App，请检查包名或安装状态。", success = false)
             return
         }
 
@@ -113,50 +166,76 @@ class BossAccessibilityService : AccessibilityService() {
                 limit = 6,
                 retryDelayMs = 1200L,
                 onRetry = { stepSearch(cfg, retries + 1) },
-                onFail = { finishRound("搜索阶段失败：无法获取当前窗口节点。") }
+                onFail = { finishRound("搜索阶段失败：无法获取当前窗口节点。", success = false) }
             )
             return
         }
 
-        val searchNode = NodeUtils.findNodeByTexts(root, cfg.searchBoxTexts)
-        val clicked = NodeUtils.clickNodeOrClickableParent(searchNode)
-        if (!clicked) {
-            retryOrFinish(
-                retries = retries,
-                limit = 6,
-                retryDelayMs = 1200L,
-                onRetry = { stepSearch(cfg, retries + 1) },
-                onFail = {
-                    finishRound(
-                        "搜索阶段失败：未找到搜索入口。请在配置中调整 searchBoxTexts，或手动先进入职位列表页。"
-                    )
-                }
-            )
-            return
-        }
-
-        handler.postDelayed({
-            val query = cfg.keywordQuery()
-            val editable = NodeUtils.findEditableNode(rootInActiveWindow)
-            if (editable != null) {
-                NodeUtils.setText(editable, query)
+        clickRuleOrFallback(
+            cfg = cfg,
+            rule = cfg.searchRule(),
+            stageLabel = "搜索入口"
+        ) { clicked ->
+            if (!clicked) {
+                retryOrFinish(
+                    retries = retries,
+                    limit = 6,
+                    retryDelayMs = 1200L,
+                    onRetry = { stepSearch(cfg, retries + 1) },
+                    onFail = {
+                        finishRound(
+                            "搜索阶段失败：未找到搜索入口。请在配置中调整搜索规则，或手动先进入职位列表页。",
+                            success = false
+                        )
+                    }
+                )
+                return@clickRuleOrFallback
             }
-            val submit = NodeUtils.findNodeByTexts(rootInActiveWindow, listOf("搜索", "查找", "确定"))
-            NodeUtils.clickNodeOrClickableParent(submit)
+
             handler.postDelayed({
-                stepTryGreeting(cfg, sent = 0, attempts = 0)
-            }, 2000L)
-        }, 1200L)
+                val query = cfg.keywordQuery()
+                setTextOrFallback(
+                    cfg = cfg,
+                    rule = cfg.inputRule(),
+                    text = query,
+                    stageLabel = "搜索输入框"
+                ) { inputOk ->
+                    if (!inputOk) {
+                        retryOrFinish(
+                            retries = retries,
+                            limit = 3,
+                            retryDelayMs = 1200L,
+                            onRetry = { stepSearch(cfg, retries + 1) },
+                            onFail = {
+                                finishRound("搜索阶段失败：无法定位输入框。", success = false)
+                            }
+                        )
+                        return@setTextOrFallback
+                    }
+
+                    clickRuleOrFallback(
+                        cfg = cfg,
+                        rule = NodeLocatorRule(textCandidates = listOf("搜索", "查找", "确定")),
+                        stageLabel = "搜索确认按钮"
+                    ) {
+                        handler.postDelayed({
+                            stepTryGreeting(cfg, sent = 0, attempts = 0)
+                        }, 2000L)
+                    }
+                }
+            }, 1000L)
+        }
     }
 
     private fun stepTryGreeting(cfg: AutomationConfig, sent: Int, attempts: Int) {
         if (shouldStop()) return
+        roundState?.attemptCount = attempts
         if (sent >= cfg.maxGreetingsPerRound) {
-            finishRound("本轮完成：已达到最大发送数 ${cfg.maxGreetingsPerRound}。")
+            finishRound("本轮完成：已达到最大发送数 ${cfg.maxGreetingsPerRound}。", success = true)
             return
         }
         if (attempts >= cfg.maxGreetingsPerRound * 8) {
-            finishRound("本轮完成：超过尝试上限，停止继续滑动。")
+            finishRound("本轮完成：超过尝试上限，停止继续滑动。", success = true)
             return
         }
 
@@ -168,47 +247,134 @@ class BossAccessibilityService : AccessibilityService() {
             return
         }
 
-        val chatButton = NodeUtils.findNodeByTexts(root, cfg.chatButtonTexts)
-        if (chatButton == null || !NodeUtils.clickNodeOrClickableParent(chatButton)) {
-            swipeUp()
+        clickRuleOrFallback(
+            cfg = cfg,
+            rule = cfg.chatRule(),
+            stageLabel = "沟通按钮"
+        ) { chatOpened ->
+            if (!chatOpened) {
+                swipeUp()
+                handler.postDelayed({
+                    stepTryGreeting(cfg, sent, attempts + 1)
+                }, 1500L)
+                return@clickRuleOrFallback
+            }
+
             handler.postDelayed({
-                stepTryGreeting(cfg, sent, attempts + 1)
-            }, 1500L)
+                val currentRoot = rootInActiveWindow
+                val dedupeKey = buildDedupeKey(currentRoot)
+                if (isDuplicateAndNotExpired(dedupeKey, cfg.dedupeHours)) {
+                    ConfigStore.appendLog(this, "命中去重规则，跳过本次发送。")
+                    performGlobalAction(GLOBAL_ACTION_BACK)
+                    handler.postDelayed({
+                        stepTryGreeting(cfg, sent, attempts + 1)
+                    }, 1200L)
+                    return@postDelayed
+                }
+
+                setTextOrFallback(
+                    cfg = cfg,
+                    rule = cfg.inputRule(),
+                    text = cfg.greetingTemplate,
+                    stageLabel = "沟通输入框"
+                ) { inputOk ->
+                    if (!inputOk) {
+                        ConfigStore.appendLog(this, "输入框未命中，返回岗位列表继续。")
+                        performGlobalAction(GLOBAL_ACTION_BACK)
+                        handler.postDelayed({
+                            stepTryGreeting(cfg, sent, attempts + 1)
+                        }, 1200L)
+                        return@setTextOrFallback
+                    }
+
+                    clickRuleOrFallback(
+                        cfg = cfg,
+                        rule = cfg.sendRule(),
+                        stageLabel = "发送按钮"
+                    ) { sentOk ->
+                        if (sentOk) {
+                            markDedupe(dedupeKey)
+                            roundState?.sentCount = (roundState?.sentCount ?: 0) + 1
+                            ConfigStore.appendLog(this, "已发送一条打招呼消息。")
+                        } else {
+                            ConfigStore.appendLog(this, "发送按钮未命中，本次跳过。")
+                        }
+
+                        performGlobalAction(GLOBAL_ACTION_BACK)
+                        handler.postDelayed({
+                            stepTryGreeting(cfg, sent + if (sentOk) 1 else 0, attempts + 1)
+                        }, 1200L)
+                    }
+                }
+            }, 1200L)
+        }
+    }
+
+    private fun clickRuleOrFallback(
+        cfg: AutomationConfig,
+        rule: NodeLocatorRule,
+        stageLabel: String,
+        onResult: (Boolean) -> Unit
+    ) {
+        val root = rootInActiveWindow
+        val target = NodeUtils.findNodeByRule(root, rule)
+        if (NodeUtils.clickNodeOrClickableParent(target)) {
+            onResult(true)
             return
         }
 
-        handler.postDelayed({
-            val currentRoot = rootInActiveWindow
-            val dedupeKey = buildDedupeKey(currentRoot)
-            if (isDuplicateAndNotExpired(dedupeKey, cfg.dedupeHours)) {
-                ConfigStore.appendLog(this, "命中去重规则，跳过本次发送。")
-                performGlobalAction(GLOBAL_ACTION_BACK)
+        if (!cfg.enableOcrFallback || rule.textCandidates.isEmpty()) {
+            onResult(false)
+            return
+        }
+
+        ocrClickHelper.clickByKeywords(rule.textCandidates) { ok, message ->
+            if (ok) {
+                roundState?.ocrFallbackHits = (roundState?.ocrFallbackHits ?: 0) + 1
+            }
+            ConfigStore.appendLog(this, "$stageLabel OCR兜底：$message")
+            onResult(ok)
+        }
+    }
+
+    private fun setTextOrFallback(
+        cfg: AutomationConfig,
+        rule: NodeLocatorRule,
+        text: String,
+        stageLabel: String,
+        onResult: (Boolean) -> Unit
+    ) {
+        val root = rootInActiveWindow
+        val inputNode = NodeUtils.findEditableNodeByRule(root, rule)
+        if (inputNode != null) {
+            NodeUtils.clickNodeOrClickableParent(inputNode)
+            if (NodeUtils.setText(inputNode, text)) {
+                onResult(true)
+                return
+            }
+        }
+
+        if (!cfg.enableOcrFallback || rule.textCandidates.isEmpty()) {
+            onResult(false)
+            return
+        }
+
+        ocrClickHelper.clickByKeywords(rule.textCandidates) { ok, message ->
+            if (ok) {
+                roundState?.ocrFallbackHits = (roundState?.ocrFallbackHits ?: 0) + 1
                 handler.postDelayed({
-                    stepTryGreeting(cfg, sent, attempts + 1)
-                }, 1200L)
-                return@postDelayed
-            }
-
-            val input = NodeUtils.findEditableNode(currentRoot)
-                ?: NodeUtils.findNodeByTexts(currentRoot, cfg.inputHintTexts)
-            NodeUtils.clickNodeOrClickableParent(input)
-            NodeUtils.setText(input, cfg.greetingTemplate)
-
-            val sendBtn = NodeUtils.findNodeByTexts(rootInActiveWindow, cfg.sendButtonTexts)
-            val sentOk = NodeUtils.clickNodeOrClickableParent(sendBtn)
-
-            if (sentOk) {
-                markDedupe(dedupeKey)
-                ConfigStore.appendLog(this, "已发送一条打招呼消息。")
+                    val retryInput = NodeUtils.findEditableNodeByRule(rootInActiveWindow, rule)
+                    val setOk = NodeUtils.setText(retryInput, text)
+                    if (!setOk) {
+                        ConfigStore.appendLog(this, "$stageLabel OCR后仍未找到可输入控件。")
+                    }
+                    onResult(setOk)
+                }, 550L)
             } else {
-                ConfigStore.appendLog(this, "发送按钮未命中，本次跳过。")
+                ConfigStore.appendLog(this, "$stageLabel OCR兜底失败：$message")
+                onResult(false)
             }
-
-            performGlobalAction(GLOBAL_ACTION_BACK)
-            handler.postDelayed({
-                stepTryGreeting(cfg, sent + if (sentOk) 1 else 0, attempts + 1)
-            }, 1200L)
-        }, 1200L)
+        }
     }
 
     private fun retryOrFinish(
@@ -242,23 +408,63 @@ class BossAccessibilityService : AccessibilityService() {
     private fun shouldStop(): Boolean {
         if (!roundRunning) return true
         if (!ConfigStore.isEnabled(this)) {
-            finishRound("检测到调度已暂停，结束当前流程。")
+            finishRound("检测到调度已暂停，结束当前流程。", success = true)
             return true
         }
         if (stopRequested) {
-            finishRound("检测到停止请求，结束当前流程。")
+            finishRound("检测到停止请求，结束当前流程。", success = true)
             return true
         }
         return false
     }
 
-    private fun finishRound(reason: String) {
+    private fun finishRound(reason: String, success: Boolean) {
         if (!roundRunning) {
             return
         }
         roundRunning = false
         stopRequested = false
+
+        val now = System.currentTimeMillis()
+        val snapshot = roundState ?: RoundState(
+            id = UUID.randomUUID().toString(),
+            startedAt = now
+        )
+        roundState = null
+
+        val persistHistory: (String?) -> Unit = { screenshotPath ->
+            TaskHistoryStore.append(
+                context = this,
+                entry = TaskHistoryEntry(
+                    id = snapshot.id,
+                    startedAt = snapshot.startedAt,
+                    finishedAt = now,
+                    success = success,
+                    sentCount = snapshot.sentCount,
+                    attemptCount = snapshot.attemptCount,
+                    ocrFallbackHits = snapshot.ocrFallbackHits,
+                    reason = reason,
+                    screenshotPath = screenshotPath
+                )
+            )
+            notifyStatusRefresh()
+        }
+
+        if (!success) {
+            ScreenshotTools.captureAndSaveFailure(this, reason.take(18)) { path ->
+                if (!path.isNullOrBlank()) {
+                    ConfigStore.appendLog(this, "失败截图已保存：$path")
+                } else {
+                    ConfigStore.appendLog(this, "失败截图保存失败（可能系统限制截图）。")
+                }
+                ConfigStore.appendLog(this, reason)
+                persistHistory(path)
+            }
+            return
+        }
+
         ConfigStore.appendLog(this, reason)
+        persistHistory(null)
     }
 
     private fun buildDedupeKey(root: AccessibilityNodeInfo?): String {
@@ -305,6 +511,12 @@ class BossAccessibilityService : AccessibilityService() {
             .edit()
             .putString(KEY_DEDUPE_JSON, json.toString())
             .apply()
+    }
+
+    private fun notifyStatusRefresh() {
+        sendBroadcast(Intent(ACTION_REFRESH_STATUS).apply {
+            `package` = packageName
+        })
     }
 
     companion object {

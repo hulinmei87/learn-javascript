@@ -11,10 +11,19 @@ data class AutomationConfig(
     val intervalMinutes: Int = 30,
     val maxGreetingsPerRound: Int = 8,
     val dedupeHours: Int = 72,
+    val enableOcrFallback: Boolean = true,
     val searchBoxTexts: List<String> = listOf("搜索", "职位", "公司"),
+    val searchBoxViewIds: List<String> = emptyList(),
+    val searchBoxClassNames: List<String> = emptyList(),
     val chatButtonTexts: List<String> = listOf("立即沟通", "沟通"),
+    val chatButtonViewIds: List<String> = emptyList(),
+    val chatButtonClassNames: List<String> = emptyList(),
     val inputHintTexts: List<String> = listOf("请输入", "发消息"),
-    val sendButtonTexts: List<String> = listOf("发送")
+    val inputViewIds: List<String> = emptyList(),
+    val inputClassNames: List<String> = listOf("EditText"),
+    val sendButtonTexts: List<String> = listOf("发送"),
+    val sendButtonViewIds: List<String> = emptyList(),
+    val sendButtonClassNames: List<String> = emptyList()
 ) {
     fun salaryLabel(): String = "${salaryMinK}K-${salaryMaxK}K"
 
@@ -34,4 +43,28 @@ data class AutomationConfig(
         }
         return parts.joinToString(" ")
     }
+
+    fun searchRule() = NodeLocatorRule(
+        textCandidates = searchBoxTexts,
+        viewIdCandidates = searchBoxViewIds,
+        classCandidates = searchBoxClassNames
+    )
+
+    fun chatRule() = NodeLocatorRule(
+        textCandidates = chatButtonTexts,
+        viewIdCandidates = chatButtonViewIds,
+        classCandidates = chatButtonClassNames
+    )
+
+    fun inputRule() = NodeLocatorRule(
+        textCandidates = inputHintTexts,
+        viewIdCandidates = inputViewIds,
+        classCandidates = inputClassNames
+    )
+
+    fun sendRule() = NodeLocatorRule(
+        textCandidates = sendButtonTexts,
+        viewIdCandidates = sendButtonViewIds,
+        classCandidates = sendButtonClassNames
+    )
 }

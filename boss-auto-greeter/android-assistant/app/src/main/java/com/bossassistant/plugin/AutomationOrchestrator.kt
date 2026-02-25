@@ -45,6 +45,7 @@ object AutomationOrchestrator {
             scheduleNext(context, 3_000L)
         }
         ConfigStore.appendLog(context, "调度已启动，间隔 ${config.intervalMinutes} 分钟。")
+        notifyStatusRefresh(context)
     }
 
     fun pause(context: Context) {
@@ -53,6 +54,7 @@ object AutomationOrchestrator {
         ConfigStore.setEnabled(context, false)
         context.sendBroadcast(Intent(ACTION_PAUSE).apply { `package` = context.packageName })
         ConfigStore.appendLog(context, "调度已暂停。")
+        notifyStatusRefresh(context)
     }
 
     fun onAlarmTriggered(context: Context) {
@@ -73,5 +75,11 @@ object AutomationOrchestrator {
             .edit()
             .putLong(KEY_LAST_RUN_AT, System.currentTimeMillis())
             .apply()
+    }
+
+    private fun notifyStatusRefresh(context: Context) {
+        context.sendBroadcast(Intent(ACTION_REFRESH_STATUS).apply {
+            `package` = context.packageName
+        })
     }
 }

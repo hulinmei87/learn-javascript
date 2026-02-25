@@ -1,10 +1,16 @@
 package com.bossassistant.plugin
 
+import android.content.BroadcastReceiver
 import android.content.Intent
+import android.content.IntentFilter
+import android.graphics.Bitmap
+import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageView
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -24,8 +30,21 @@ class MainActivity : AppCompatActivity() {
     private lateinit var etChatTexts: EditText
     private lateinit var etInputTexts: EditText
     private lateinit var etSendTexts: EditText
+    private lateinit var swOcrFallback: Switch
+    private lateinit var tvRecordingState: TextView
     private lateinit var tvStatus: TextView
     private lateinit var tvLog: TextView
+    private lateinit var tvHistory: TextView
+    private lateinit var ivLastFailure: ImageView
+    private var lastFailureBitmap: Bitmap? = null
+
+    private val statusReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: android.content.Context?, intent: Intent?) {
+            if (intent?.action == ACTION_REFRESH_STATUS) {
+                refreshStatus()
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -45,8 +64,12 @@ class MainActivity : AppCompatActivity() {
         etChatTexts = findViewById(R.id.etChatTexts)
         etInputTexts = findViewById(R.id.etInputTexts)
         etSendTexts = findViewById(R.id.etSendTexts)
+        swOcrFallback = findViewById(R.id.swOcrFallback)
+        tvRecordingState = findViewById(R.id.tvRecordingState)
         tvStatus = findViewById(R.id.tvStatus)
         tvLog = findViewById(R.id.tvLog)
+        tvHistory = findViewById(R.id.tvHistory)
+        ivLastFailure = findViewById(R.id.ivLastFailure)
 
         findViewById<Button>(R.id.btnSave).setOnClickListener {
             saveConfigFromForm()
@@ -91,6 +114,45 @@ class MainActivity : AppCompatActivity() {
             })
             showToast("已触发立即执行")
         }
+
+        findViewById<Button>(R.id.btnRecordStart).setOnClickListener {
+            sendBroadcast(Intent(ACTION_RECORD_START).apply { `package` = packageName })
+            showToast("录制已开始，请切到 Boss App 按顺序手动点击")
+            refreshStatus()
+        }
+
+        findViewById<Button>(R.id.btnRecordStop).setOnClickListener {
+            sendBroadcast(Intent(ACTION_RECORD_STOP).apply { `package` = packageName })
+            showToast("录制已停止")
+            refreshStatus()
+        }
+
+        findViewById<Button>(R.id.btnRecordClear).setOnClickListener {
+            sendBroadcast(Intent(ACTION_RECORD_CLEAR).apply { `package` = packageName })
+            showToast("已清空录制规则")
+            refreshStatus()
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        val filter = IntentFilter(ACTION_REFRESH_STATUS)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(statusReceiver, filter, RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(statusReceiver, filter)
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        runCatching { unregisterReceiver(statusReceiver) }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        lastFailureBitmap?.recycle()
+        lastFailureBitmap = null
     }
 
     override fun onResume() {
@@ -115,6 +177,7 @@ class MainActivity : AppCompatActivity() {
         etChatTexts.setText(cfg.chatButtonTexts.joinToString(","))
         etInputTexts.setText(cfg.inputHintTexts.joinToString(","))
         etSendTexts.setText(cfg.sendButtonTexts.joinToString(","))
+        swOcrFallback.isChecked = cfg.enableOcrFallback
     }
 
     private fun saveConfigFromForm() {
@@ -133,7 +196,8 @@ class MainActivity : AppCompatActivity() {
             searchBoxTexts = etSearchTexts.textCsvOr(old.searchBoxTexts),
             chatButtonTexts = etChatTexts.textCsvOr(old.chatButtonTexts),
             inputHintTexts = etInputTexts.textCsvOr(old.inputHintTexts),
-            sendButtonTexts = etSendTexts.textCsvOr(old.sendButtonTexts)
+            sendButtonTexts = etSendTexts.textCsvOr(old.sendButtonTexts),
+            enableOcrFallback = swOcrFallback.isChecked
         )
         ConfigStore.save(this, cfg)
     }
@@ -141,14 +205,28 @@ class MainActivity : AppCompatActivity() {
     private fun refreshStatus() {
         val enabled = ConfigStore.isEnabled(this)
         val serviceOn = BossAccessibilityService.isAccessibilityEnabled(this)
+        val recordingOn = ConfigStore.isRecording(this)
+        val recordingStage = ConfigStore.currentRecordingStage(this)
+        val cfg = ConfigStore.load(this)
+        val history = TaskHistoryStore.summary(this)
         val status = buildString {
             append("调度状态：")
             append(if (enabled) "运行中" else "已暂停")
             append("\n无障碍权限：")
             append(if (serviceOn) "已开启" else "未开启")
+            append("\nOCR兜底：")
+            append(if (cfg.enableOcrFallback) "开启" else "关闭")
+            append("\n录制模式：")
+            append(if (recordingOn) "进行中" else "未开启")
+            append("\n录制阶段：")
+            append(recordingStage)
         }
         tvStatus.text = status
+        tvRecordingState.text = "录制状态：${if (recordingOn) "进行中（下一步：$recordingStage）" else "未开始"}"
         tvLog.text = ConfigStore.getLastLog(this).ifBlank { "暂无日志" }
+
+        tvHistory.text = buildHistoryText(history)
+        renderFailureScreenshot(history.latestFailureScreenshotPath)
     }
 
     private fun EditText.textString(): String = text?.toString()?.trim().orEmpty()
@@ -166,5 +244,34 @@ class MainActivity : AppCompatActivity() {
 
     private fun showToast(message: String) {
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+    }
+
+    private fun buildHistoryText(summary: TaskHistorySummary): String {
+        val lines = mutableListOf<String>()
+        lines += "总轮次: ${summary.totalRuns}  成功: ${summary.successRuns}  失败: ${summary.failureRuns}"
+        if (summary.recentEntries.isNotEmpty()) {
+            lines += "最近执行："
+        }
+
+        summary.recentEntries.forEachIndexed { index, entry ->
+            val status = if (entry.success) "成功" else "失败"
+            lines += "${index + 1}. $status sent=${entry.sentCount} attempt=${entry.attemptCount} ocr=${entry.ocrFallbackHits}"
+            lines += "   reason=${entry.reason}"
+            if (!entry.screenshotPath.isNullOrBlank()) {
+                lines += "   screenshot=${entry.screenshotPath}"
+            }
+        }
+        return lines.joinToString("\n").ifBlank { "暂无历史" }
+    }
+
+    private fun renderFailureScreenshot(path: String?) {
+        val bitmap = ScreenshotTools.decode(path)
+        lastFailureBitmap?.recycle()
+        lastFailureBitmap = bitmap
+        if (bitmap != null) {
+            ivLastFailure.setImageBitmap(bitmap)
+        } else {
+            ivLastFailure.setImageDrawable(null)
+        }
     }
 }
